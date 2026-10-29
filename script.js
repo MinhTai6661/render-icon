@@ -3,6 +3,13 @@ const { createApp } = Vue;
 
 const DEFAULT_ICON = '😆';
 const LINE_HEIGHT = 20;
+// "Copy for Slack" layout, measured from Slack: spaces are ~3.8px, an emoji is ~5 of them wide and ~23px tall.
+// Slack cells are near-square while the preview's are wide, so the grid is rebuilt (more columns) to keep
+// the shape's proportions; the on-page preview keeps the editor font's layout.
+const CHAT_EMOJI_WIDTH = 5;
+const CHAT_MIN_GAP = 3; // spaces between emoji; Slack's are so narrow that 1 looks like none
+const CHAT_SPACE_PX = 3.8;
+const CHAT_ROW_PX = 23;
 const MAX_SCROLL_HEIGHT = 10000000; // browsers clamp element height; scroll is scaled beyond this
 const PREVIEW_LINES = 40;
 const PNG_MAX_LINES = 1000;
@@ -338,52 +345,19 @@ function applyTheme(theme) {
     }
 }
 
-const MONO_STYLE = "font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;margin:0";
-
-function escapeHtml(text) {
-    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// Selecting text by hand copies it with its monospace styling, so pasting into chat or rich-text apps
-// keeps the shape. A plain writeText() only carries characters, which those apps show in a
-// proportional font. With `rich` we copy both: the plain text and a monospace <pre>.
-async function copyToClipboard(text, rich) {
-    if (rich && navigator.clipboard && window.isSecureContext && window.ClipboardItem) {
-        const html = '<pre style="' + MONO_STYLE + '">' + escapeHtml(text) + '</pre>';
-        await navigator.clipboard.write([
-            new ClipboardItem({
-                'text/plain': new Blob([text], { type: 'text/plain' }),
-                'text/html': new Blob([html], { type: 'text/html' })
-            })
-        ]);
-        return;
-    }
-    if (!rich && navigator.clipboard && window.isSecureContext) {
+async function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(text);
         return;
     }
-    // Fallback (insecure pages): select a styled <pre>, exactly what a manual copy does.
-    const el = document.createElement(rich ? 'pre' : 'textarea');
-    if (rich) {
-        el.style.cssText = MONO_STYLE + ';position:fixed;left:-9999px;top:0';
-        el.textContent = text;
-    } else {
-        el.value = text;
-        el.style.cssText = 'position:fixed;left:-9999px';
-    }
+    const el = document.createElement('textarea');
+    el.value = text;
+    el.style.position = 'fixed';
+    el.style.left = '-9999px';
     document.body.appendChild(el);
-    if (rich) {
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        const selection = window.getSelection();
-        selection.removeAllRanges();
-        selection.addRange(range);
-    } else {
-        el.focus();
-        el.select();
-    }
+    el.focus();
+    el.select();
     document.execCommand('copy');
-    window.getSelection().removeAllRanges();
     document.body.removeChild(el);
 }
 
@@ -396,6 +370,18 @@ function downloadBlob(blob, filename) {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function spacingFor(w, minGap = 1) {
+    let best = null;
+    for (let gap = minGap; gap <= minGap + 3; gap++) {
+        const step = Math.max(1, Math.round((w + gap) / 2));
+        const error = Math.abs(w + gap - step * 2);
+        if (!best || error < best.error - 1e-9) {
+            best = { gap, step, error };
+        }
+    }
+    return best;
 }
 
 function applyExportFormat(text, format) {
@@ -423,6 +409,7 @@ createApp({
             exportFormats: EXPORT_FORMATS,
             // feedback
             copied: false,
+            slackCopied: false,
             linkCopied: false,
             notice: '',
             feedbackTimer: null,
@@ -507,16 +494,25 @@ createApp({
         // Gap (in spaces) between icons and the resulting half-step. Icon + gap should be an
         // even number of spaces so each half-step is whole; pick the gap that gets closest to that.
         iconSpacing() {
-            const w = this.iconWidth;
-            let best = null;
-            for (let gap = 1; gap <= 4; gap++) {
-                const step = Math.max(1, Math.round((w + gap) / 2));
-                const error = Math.abs(w + gap - step * 2);
-                if (!best || error < best.error - 1e-9) {
-                    best = { gap, step, error };
+            return spacingFor(this.iconWidth);
+        },
+        // Same shape laid out for pasting into Slack (see CHAT_* constants).
+        chatLayout() {
+            const spacing = spacingFor(CHAT_EMOJI_WIDTH, CHAT_MIN_GAP);
+            const aspect = (spacing.step * 2 * CHAT_SPACE_PX) / CHAT_ROW_PX;
+            // A shape's height depends on the aspect, so scale the line count with it or the shape would repeat.
+            let lines = this.totalLines;
+            let amplitude = this.safeAmplitude;
+            if (this.pattern.shapeRows) {
+                // Square cells make the same radius much smaller on screen, so grow it until the shape is as
+                // tall as the preview's (same number of rows).
+                while (amplitude < 40 && this.pattern.shapeRows(amplitude, aspect) < this.shapeRows) {
+                    amplitude++;
                 }
+                const mine = this.pattern.shapeRows(amplitude, aspect);
+                lines = Math.max(1, Math.round(((this.totalLines + 1) * (mine + 1)) / (this.shapeRows + 1)) - 1);
             }
-            return best;
+            return { spacing, aspect, lines, amplitude };
         },
         // Slot width / row height: how much wider than tall one icon slot looks. Shapes use it to stay in proportion.
         cellAspect() {
@@ -692,10 +688,10 @@ createApp({
             return this.cycleMode === 'diagonal' ? i + idx : i;
         },
         // Structure of line `i`; lines are built on demand, so cost follows what is shown, not the line count.
-        lineParts(i) {
+        lineParts(i, layout) {
             const p = this.pattern;
-            const { gap, step } = this.iconSpacing;
-            const row = p.row(i, this.safeAmplitude, this.safeCurveLength, step * 2 - 1, this.cellAspect);
+            const { gap, step } = layout ? layout.spacing : this.iconSpacing;
+            const row = p.row(i, layout ? layout.amplitude : this.safeAmplitude, this.safeCurveLength, step * 2 - 1, layout ? layout.aspect : this.cellAspect);
             const list = this.iconList;
             const n = list.length;
             const cells = (n === 0 ? [] : row.cells).map((idx) => ({
@@ -704,8 +700,8 @@ createApp({
             }));
             return { pad: row.pad, cells, gap, slot: step * 2, num: this.showLineNumbers ? String(i + 1) : '' };
         },
-        lineAt(i) {
-            const { pad, cells, gap, slot, num } = this.lineParts(i);
+        lineAt(i, layout) {
+            const { pad, cells, gap, slot, num } = this.lineParts(i, layout);
             if (!cells.length) {
                 return num ? ' '.repeat(pad) + num : '';
             }
@@ -717,15 +713,15 @@ createApp({
             }
             return num ? s + ' ' + num : s;
         },
-        buildFullText() {
-            const n = this.totalLines;
+        buildFullText(layout) {
+            const n = layout ? layout.lines : this.totalLines;
             const chunks = [];
             const CHUNK = 20000;
             for (let s = 0; s < n; s += CHUNK) {
                 const end = Math.min(n, s + CHUNK);
                 const part = new Array(end - s);
                 for (let i = s, k = 0; i < end; i++, k++) {
-                    part[k] = this.lineAt(i);
+                    part[k] = this.lineAt(i, layout);
                 }
                 chunks.push(part.join('\n'));
             }
@@ -739,9 +735,31 @@ createApp({
             clearTimeout(this.feedbackTimer);
             this.feedbackTimer = setTimeout(() => {
                 this.copied = false;
+                this.slackCopied = false;
                 this.linkCopied = false;
                 this.notice = '';
             }, 1600);
+        },
+        async copySlack() {
+            let text;
+            try {
+                text = this.buildFullText(this.chatLayout);
+                // Slack trim()s the message, which eats the first row's indent; a zero-width space is not
+                // whitespace to trim(), so it shields the indent without changing any widths.
+                if (text.startsWith(' ')) {
+                    text = '\u200B' + text;
+                }
+            } catch (error) {
+                this.notice = 'Output is too large to build in memory.';
+                return;
+            }
+            try {
+                await copyToClipboard(text);
+                this.flash('slackCopied');
+            } catch (error) {
+                console.error('Copy failed:', error);
+                this.notice = 'Copy failed (output may be too large for the clipboard).';
+            }
         },
         async copyOutput() {
             let text;
@@ -752,8 +770,7 @@ createApp({
                 return;
             }
             try {
-                // code blocks are markdown: keep them plain; everything else also carries monospace styling
-                await copyToClipboard(text, this.exportFormat !== 'code');
+                await copyToClipboard(text);
                 this.flash('copied');
             } catch (error) {
                 console.error('Copy failed:', error);

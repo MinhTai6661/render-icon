@@ -1054,6 +1054,7 @@
                         </div>
                         <div class="bar-actions">
                             <label class="check line-numbers"><input type="checkbox" v-model="showLineNumbers" /> Line numbers</label>
+                            <button type="button" class="btn" @click="copySlack" title="Re-spaced for Slack's narrow spaces and square emoji. Paste the :shortcode: or emoji as a normal message, not a code block.">{{ slackCopied ? '✓ Copied' : 'Copy for Slack' }}</button>
                             <button type="button" class="btn primary" @click="copyOutput">{{ copied ? '✓ Copied' : 'Copy all' }}</button>
                         </div>
                     </div>
